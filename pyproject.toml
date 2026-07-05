@@ -1,0 +1,49 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "llama-benchy-viz-web"
+version = "0.1.0"
+description = "Web dashboard for llama-benchy benchmarks. Consumes the --emit-progress JSONL stream."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { file = "LICENSE" }
+authors = [
+    { name = "Alex Ziskind" },
+]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Internet :: WWW/HTTP :: Dynamic Content",
+    "Intended Audience :: Science/Research",
+    "Intended Audience :: Developers",
+]
+keywords = ["llm", "benchmarking", "web", "dashboard", "sse", "llama-benchy"]
+dependencies = [
+    "llama-benchy-viz-tui",
+    "aiohttp>=3.9",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=7"]
+
+[project.scripts]
+llama-benchy-viz-web = "llama_benchy_viz_web.__main__:main"
+
+[project.urls]
+"Homepage" = "https://github.com/alexziskind1/llama-benchy-viz-web"
+"Upstream tool" = "https://github.com/eugr/llama-benchy"
+"Sister TUI" = "https://github.com/alexziskind1/llama-benchy-viz-tui"
+"Schema" = "https://github.com/eugr/llama-benchy/blob/main/docs/progress-schema.md"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/llama_benchy_viz_web"]
+
+[tool.uv.sources]
+llama-benchy-viz-tui = { path = "../llama-benchy-viz-tui", editable = true }
