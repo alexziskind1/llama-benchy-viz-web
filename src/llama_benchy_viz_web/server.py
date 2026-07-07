@@ -157,14 +157,19 @@ class DashboardServer:
         return resp
 
     async def index_handler(self, request: web.Request) -> web.FileResponse:
-        return web.FileResponse(STATIC_DIR / "index.html")
+        return web.FileResponse(
+            STATIC_DIR / "index.html",
+            headers={"Cache-Control": "no-store"},
+        )
 
     async def static_handler(self, request: web.Request) -> web.Response:
         rel = request.match_info["path"]
         p = (STATIC_DIR / rel).resolve()
         if not str(p).startswith(str(STATIC_DIR.resolve())) or not p.is_file():
             return web.Response(status=404, text="not found")
-        return web.FileResponse(p)
+        # No caching while we're actively iterating on the frontend —
+        # ensures browser always gets the newest CSS/JS on reload.
+        return web.FileResponse(p, headers={"Cache-Control": "no-store"})
 
     async def info_handler(self, request: web.Request) -> web.Response:
         return web.json_response(

@@ -2,18 +2,31 @@
 // disposeStaleCharts helper so uPlot instances don't leak when a chart
 // module leaves the view-model.
 
-import { makeOrUpdateChart, disposeChart, knownChartIds } from "/static/chart.js";
+import {
+  makeOrUpdateChart,
+  disposeChart,
+  knownChartIds,
+  getChartWrapper,
+  setChartWrapper,
+} from "/static/chart.js";
 
 // ─── format helpers ───────────────────────────────────────────────────
 
 function formatMetric(m) {
   if (!m || m.value === null || m.value === undefined) return "—";
   const fmt = m.fmt || "{:.1f}";
-  // Support "{:.Nf}" and "{:.Nfe}" – all our real specs are {:.0f}..{:.3f}.
   const match = /{:\.(\d+)f}/.exec(fmt);
   const digits = match ? Number(match[1]) : 1;
   const value = Number(m.value).toFixed(digits);
   return m.unit ? `${value} ${m.unit}` : value;
+}
+
+function splitValueUnit(m) {
+  if (!m || m.value === null || m.value === undefined) return ["—", ""];
+  const fmt = m.fmt || "{:.1f}";
+  const match = /{:\.(\d+)f}/.exec(fmt);
+  const digits = match ? Number(match[1]) : 1;
+  return [Number(m.value).toFixed(digits), m.unit || ""];
 }
 
 function el(tag, attrs = {}, children = []) {
@@ -21,7 +34,14 @@ function el(tag, attrs = {}, children = []) {
   for (const [k, v] of Object.entries(attrs)) {
     if (v === null || v === undefined || v === false) continue;
     if (k === "class") n.className = v;
-    else if (k === "style" && typeof v === "object") Object.assign(n.style, v);
+    else if (k === "style" && typeof v === "object") {
+      for (const [prop, val] of Object.entries(v)) {
+        // CSS custom properties (--x) don't flow through style object
+        // assignment; use setProperty explicitly.
+        if (prop.startsWith("--")) n.style.setProperty(prop, val);
+        else n.style[prop] = val;
+      }
+    }
     else if (k === "dataset") Object.assign(n.dataset, v);
     else if (k.startsWith("on") && typeof v === "function") n.addEventListener(k.slice(2), v);
     else n.setAttribute(k, v);
@@ -33,45 +53,60 @@ function el(tag, attrs = {}, children = []) {
   return n;
 }
 
+function svgEl(tag, attrs = {}) {
+  const ns = "http://www.w3.org/2000/svg";
+  const n = document.createElementNS(ns, tag);
+  for (const [k, v] of Object.entries(attrs)) {
+    if (v === null || v === undefined) continue;
+    n.setAttribute(k, v);
+  }
+  return n;
+}
+
 function sparklineSVG(values, color) {
+  // Line + area fill, sized to fill its container via viewBox.
   if (!values || values.length < 2) return el("span");
-  const w = 80, h = 20, pad = 1;
+  const w = 200, h = 42, pad = 2;
   const min = Math.min(...values);
   const max = Math.max(...values);
   const span = max - min || 1;
-  const pts = values.map((v, i) => {
+  const pointsArr = values.map((v, i) => {
     const x = pad + (i / (values.length - 1)) * (w - 2 * pad);
     const y = h - pad - ((v - min) / span) * (h - 2 * pad);
-    return `${x.toFixed(1)},${y.toFixed(1)}`;
-  }).join(" ");
-  const ns = "http://www.w3.org/2000/svg";
-  const svg = document.createElementNS(ns, "svg");
-  svg.setAttribute("width", w);
-  svg.setAttribute("height", h);
-  svg.setAttribute("viewBox", `0 0 ${w} ${h}`);
-  const poly = document.createElementNS(ns, "polyline");
-  poly.setAttribute("points", pts);
-  poly.setAttribute("fill", "none");
-  poly.setAttribute("stroke", color || "currentColor");
-  poly.setAttribute("stroke-width", "1.5");
-  svg.appendChild(poly);
+    return [x, y];
+  });
+  const linePts = pointsArr.map(([x, y]) => `${x.toFixed(1)},${y.toFixed(1)}`).join(" ");
+  const areaPath = [
+    `M ${pointsArr[0][0].toFixed(1)},${(h - pad).toFixed(1)}`,
+    ...pointsArr.map(([x, y]) => `L ${x.toFixed(1)},${y.toFixed(1)}`),
+    `L ${pointsArr[pointsArr.length - 1][0].toFixed(1)},${(h - pad).toFixed(1)} Z`,
+  ].join(" ");
+  const svg = svgEl("svg", { viewBox: `0 0 ${w} ${h}`, preserveAspectRatio: "none" });
+  const area = svgEl("path", { class: "sparkline-area", d: areaPath });
+  const line = svgEl("polyline", { class: "sparkline-line", points: linePts });
+  svg.appendChild(area);
+  svg.appendChild(line);
   return svg;
 }
 
 // ─── per-kind renderers ───────────────────────────────────────────────
 
 function renderHeader(s) {
+  const stats = el("span", { class: "stats" });
+  if (s.benchmark_name) stats.appendChild(el("span", {}, s.benchmark_name));
+  if (s.configured_count != null) {
+    if (stats.children.length) stats.appendChild(el("span", { class: "dot" }));
+    stats.appendChild(el("span", {}, `${s.active_count ?? 0}/${s.configured_count} active`));
+  }
+
   return el("div", { class: "header" }, [
     el("span", { class: "title" }, [
       el("span", {}, s.title || "LLM BENCH"),
       " ",
       el("span", { class: "accent" }, s.accent || "VIZ"),
     ]),
-    el("span", { class: "stats" }, [
-      s.benchmark_name || "",
-      s.active_count != null ? `  ·  ${s.active_count}/${s.configured_count} active` : "",
-      s.elapsed_s != null ? `  ·  ${s.elapsed_s.toFixed(1)}s` : "",
-    ].join("")),
+    stats,
+    s.elapsed_s != null ? el("span", { class: "elapsed" }, `${s.elapsed_s.toFixed(1)}s elapsed`) : null,
     el("span", { class: `mode-badge ${s.is_live ? "live" : "frozen"}` }, s.mode_label || ""),
   ]);
 }
@@ -80,7 +115,10 @@ function renderSummaryStrip(s) {
   const strip = el("div", { class: "summary-strip" });
   for (const c of s.cards || []) {
     strip.appendChild(el("div", { class: "summary-card" }, [
-      el("div", { class: "title" }, [c.icon ? `${c.icon} ` : "", c.title || ""]),
+      el("div", { class: "title" }, [
+        c.icon ? el("span", { style: c.icon_color ? { color: c.icon_color } : {} }, c.icon) : null,
+        el("span", {}, c.title || ""),
+      ]),
       el("div", { class: "primary", style: c.primary_color ? { color: c.primary_color } : {} }, c.primary || "—"),
       el("div", { class: "secondary" }, c.secondary || ""),
     ]));
@@ -88,36 +126,48 @@ function renderSummaryStrip(s) {
   return strip;
 }
 
-function renderStreamCard(s, opts = {}) {
+function renderStreamCard(s) {
   const stream = s.stream || {};
-  const big = formatMetric(s.big_metric);
-  const rows = [];
+  const [bigVal, bigUnit] = splitValueUnit(s.big_metric);
+
+  const metricsCells = [];
   for (const row of s.metrics_grid || []) {
     for (const m of row) {
-      rows.push(el("span", { class: "metric-label" }, m.label || ""));
-      rows.push(el("span", { class: "metric-value" }, formatMetric(m)));
+      metricsCells.push(el("div", { class: "metric-cell" }, [
+        el("span", { class: "metric-label" }, m.label || ""),
+        el("span", { class: "metric-value" }, formatMetric(m)),
+      ]));
     }
   }
-  const card = el("div", {
+
+  return el("div", {
     class: "stream-card",
     style: stream.color ? { "--stream-color": stream.color } : {},
   }, [
-    el("div", { class: "name" }, stream.label || `slot ${stream.slot_index ?? "?"}`),
-    s.show_phase && s.phase ? el("span", { class: `phase ${s.phase}` }, s.phase) : null,
-    el("div", { class: "big-metric" }, big),
+    el("div", { class: "name-row" }, [
+      el("span", { class: "name" }, stream.label || `slot ${stream.slot_index ?? "?"}`),
+      (s.show_phase && s.phase) ? el("span", { class: `phase ${s.phase}` }, s.phase) : null,
+    ]),
+    el("div", { class: "hero" }, [
+      el("span", { class: "big-metric" }, bigVal),
+      el("span", { class: "big-metric-unit" }, bigUnit),
+    ]),
     (s.sparkline && s.sparkline.length > 1)
       ? el("div", { class: "sparkline" }, [sparklineSVG(s.sparkline, stream.color)])
       : null,
-    rows.length ? el("div", { class: "metrics-grid" }, rows) : null,
+    // Snippet goes ABOVE the metrics block — it flex-grows to absorb
+    // whatever vertical slack the card has, so a tall race card
+    // becomes a live "reading pane" of the model's output rather than
+    // a strip of text pinned to the bottom.
     (s.show_output && s.output_snippet) ? el("div", { class: "snippet" }, s.output_snippet) : null,
+    metricsCells.length ? el("div", { class: "metrics-grid" }, metricsCells) : null,
   ]);
-  return card;
 }
 
 function renderStreamGrid(s) {
   const n = (s.cards || []).length;
   const shape = s.grid_shape === "auto"
-    ? (n <= 1 ? "1x1" : n <= 4 ? "2x2" : "1xN")
+    ? (n <= 1 ? "1x1" : n === 2 ? "1x2" : n <= 4 ? "2x2" : "1xN")
     : (s.grid_shape || "auto");
   const grid = el("div", { class: `stream-grid grid-${shape}` });
   for (const c of s.cards || []) grid.appendChild(renderStreamCard(c));
@@ -125,12 +175,26 @@ function renderStreamGrid(s) {
 }
 
 function renderChart(s) {
-  const wrap = el("div", { class: "card chart-card" }, [
-    el("h2", {}, s.title || ""),
-    el("div", { class: "chart-mount", dataset: { moduleId: s.id } }),
-  ]);
-  // uPlot needs its container in the DOM before it can measure size.
-  // We attach it here, then hydrate in a microtask.
+  let wrap = getChartWrapper(s.id);
+  if (!wrap) {
+    wrap = el("div", { class: "card chart-card" }, [
+      el("h2", {}, [
+        s.title || "",
+        s.unit ? el("span", { class: "subtitle" }, `(${s.unit})`) : null,
+      ]),
+      el("div", { class: "chart-mount", dataset: { moduleId: s.id } }),
+    ]);
+    setChartWrapper(s.id, wrap);
+  } else {
+    // Just refresh the title if it changed.
+    const h2 = wrap.querySelector("h2");
+    if (h2) {
+      h2.replaceChildren(
+        document.createTextNode(s.title || ""),
+        ...(s.unit ? [el("span", { class: "subtitle" }, `(${s.unit})`)] : []),
+      );
+    }
+  }
   queueMicrotask(() => {
     const mount = wrap.querySelector(".chart-mount");
     if (mount && mount.isConnected) makeOrUpdateChart(s, mount);
@@ -139,6 +203,7 @@ function renderChart(s) {
 }
 
 function renderRankingTable(s) {
+  const [_, unit] = splitValueUnit(s.rows?.[0]?.primary_metric || {});
   const rows = [];
   for (const r of s.rows || []) {
     const delta = r.delta_to_leader;
@@ -150,8 +215,8 @@ function renderRankingTable(s) {
       const cls = (s.higher_is_better === false ? delta <= 0 : delta >= 0) ? "good" : "bad";
       deltaCell = el("td", { class: `num delta ${cls}` }, `${sign}${delta.toFixed(1)}`);
     }
-    rows.push(el("tr", {}, [
-      el("td", { class: "rank" }, `#${r.rank}`),
+    rows.push(el("tr", { class: `rank-${r.rank}` }, [
+      el("td", { class: "rank" }, [el("span", { class: "rank-badge" }, String(r.rank))]),
       el("td", { class: "name", style: r.stream?.color ? { color: r.stream.color } : {} }, r.stream?.label || ""),
       el("td", { class: "num" }, formatMetric(r.primary_metric)),
       deltaCell,
@@ -161,8 +226,9 @@ function renderRankingTable(s) {
     el("h2", {}, [s.title || "RANKING", el("span", { class: "subtitle" }, s.subtitle || "")]),
     el("table", { class: "ranking-table" }, [
       el("thead", {}, [el("tr", {}, [
-        el("th", {}, "#"), el("th", {}, "model"),
-        el("th", { style: { textAlign: "right" } }, formatMetric({ label: "", value: 0, unit: "tok/s" }).replace(/[\d\.]+ /, "")),
+        el("th", {}, "#"),
+        el("th", {}, "model"),
+        el("th", { style: { textAlign: "right" } }, unit || "value"),
         el("th", { style: { textAlign: "right" } }, "Δ leader"),
       ])]),
       el("tbody", {}, rows),
@@ -226,11 +292,15 @@ function renderCellsTable(s) {
 
 function renderRunMetadata(s) {
   const rows = [];
-  const kv = (k, v) => { rows.push(el("span", { class: "k" }, k)); rows.push(el("span", { class: "v" }, v)); };
+  const kv = (k, v) => rows.push(el("div", { class: "kv" }, [
+    el("span", { class: "k" }, k),
+    el("span", { class: "v" }, v),
+  ]));
   kv("producer",   s.producer_version || "—");
   kv("schema",     s.schema_version   || "—");
-  if (s.latency_ms !== null && s.latency_ms !== undefined)
+  if (s.latency_ms !== null && s.latency_ms !== undefined) {
     kv("latency",  `${s.latency_ms.toFixed(2)} ms (${s.latency_mode || "?"})`);
+  }
   if (s.started_ts)  kv("started",  new Date(s.started_ts * 1000).toLocaleTimeString());
   if (s.finished_ts) kv("finished", new Date(s.finished_ts * 1000).toLocaleTimeString());
   return el("div", { class: "card" }, [
@@ -240,17 +310,21 @@ function renderRunMetadata(s) {
 }
 
 function renderModelMetricsCard(s) {
-  // Full-detail card is very similar to stream card, differ in defaults only.
+  // Same layout as StreamCard — sizes are governed by the parent region.
   return renderStreamCard(s);
 }
 
 function renderFooter(s) {
-  return el("div", { class: "footer" }, [
+  const parts = [
     el("span", { class: `badge ${s.status}` }, s.status || ""),
     el("span", {}, s.mode_label || ""),
-    el("span", {}, `schema ${s.schema_version || "?"} · producer ${s.producer_version || "?"}`),
+    el("span", { class: "dot" }),
+    el("span", { class: "mono" }, `schema ${s.schema_version || "?"}`),
+    el("span", { class: "dot" }),
+    el("span", { class: "mono" }, `producer ${s.producer_version || "?"}`),
     el("span", { class: "hint" }, `press ${s.quit_hint || "Ctrl+C"} in server terminal to quit`),
-  ]);
+  ];
+  return el("div", { class: "footer" }, parts);
 }
 
 const DISPATCH = {
@@ -272,7 +346,7 @@ export function renderModule(spec) {
   if (!fn) {
     return el("div", { class: "card" }, [
       el("h2", {}, `unknown module: ${spec.kind}`),
-      el("pre", { style: { color: "#a1a3ad", whiteSpace: "pre-wrap" } }, JSON.stringify(spec, null, 2)),
+      el("pre", { style: { color: "var(--fg-3)", whiteSpace: "pre-wrap" } }, JSON.stringify(spec, null, 2)),
     ]);
   }
   return fn(spec);
